@@ -1,69 +1,272 @@
-import Image from "next/image";
+"use client";
+
+import { useState, useEffect, FormEvent } from "react";
+import { supabase } from "../lib/supabase";
+
+interface Reply {
+  id: string;
+  content: string;
+  created_at: string;
+  authors: {
+    display_id: number;
+  };
+}
+
+interface Post {
+  id: string;
+  content: string;
+  created_at: string;
+  authors: {
+    display_id: number;
+  };
+  replies: Reply[];
+}
+
+// 核心密码学：将用户输入的暗号 (绊码) 转化为不可逆的伪 UUID
+async function generateTripcodeUUID(secret: string) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(secret);
+  // 使用纯原生 Web Crypto API 进行 SHA-256 哈希计算
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  const hashHex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+  
+  // 截取哈希值的前 32 位，并强行拼接成数据库认可的 UUID 标准格式 (8-4-4-4-12)
+  return `${hashHex.slice(0, 8)}-${hashHex.slice(8, 12)}-4${hashHex.slice(13, 16)}-8${hashHex.slice(17, 20)}-${hashHex.slice(20, 32)}`;
+}
 
 export default function Home() {
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [content, setContent] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // 绊码 (身份暗号) 状态：保存在内存中，刷新网页即刻灰飞烟灭
+  const [tripcode, setTripcode] = useState("");
+
+  const [activeReplyPostId, setActiveReplyPostId] = useState<string | null>(null);
+  const [replyContent, setReplyContent] = useState("");
+  const [isReplying, setIsReplying] = useState(false);
+
+  useEffect(() => {
+    fetchPosts();
+    // 启动时彻底清理旧版的缓存，斩草除根
+    localStorage.removeItem("pisces_author_token"); 
+  }, []);
+
+  async function fetchPosts() {
+    const { data, error } = await supabase
+      .from("posts")
+      .select(`
+        id, content, created_at,
+        authors ( display_id ),
+        replies ( id, content, created_at, authors ( display_id ) )
+      `)
+      .order("created_at", { ascending: false }); 
+
+    if (error) {
+      console.error("获取帖子失败:", error);
+    } else {
+      const formattedData = data?.map(post => ({
+        ...post,
+        replies: post.replies.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+      })) as any;
+      setPosts(formattedData);
+    }
+  }
+
+  // 获取身份凭证的核心逻辑
+  async function resolveAuthorToken() {
+    let token;
+    if (!tripcode.trim()) {
+      // 没写密码：完全流客，生成一次性随机 UUID
+      token = crypto.randomUUID();
+    } else {
+      // 写了密码：根据密码生成固定的哈希 UUID
+      token = await generateTripcodeUUID(tripcode.trim());
+    }
+
+    // 尝试在数据库中注册这个身份
+    const { error } = await supabase.from("authors").insert([{ token: token }]);
+    // 错误码 '23505' 是 PostgreSQL 的“主键冲突”。
+    // 这说明该绊码对应的作者以前发过言，已经被记录了。这是完全正常的，我们忽略这个错误即可。
+    if (error && error.code !== "23505") {
+      throw error;
+    }
+    return token;
+  }
+
+  async function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (!content.trim()) return;
+    setIsSubmitting(true);
+    try {
+      const token = await resolveAuthorToken();
+      const { error } = await supabase.from("posts").insert([{ author_token: token, content: content }]);
+      if (error) throw error;
+      setContent("");
+      fetchPosts();
+    } catch (error) {
+      console.error("发帖出错:", error);
+      alert("发帖失败");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleReplySubmit(e: FormEvent, postId: string) {
+    e.preventDefault();
+    if (!replyContent.trim()) return;
+    setIsReplying(true);
+    try {
+      const token = await resolveAuthorToken();
+      const { error } = await supabase.from("replies").insert([{ 
+        post_id: postId,
+        author_token: token, 
+        content: replyContent 
+      }]);
+      if (error) throw error;
+      setReplyContent("");
+      setActiveReplyPostId(null);
+      fetchPosts();
+    } catch (error) {
+      console.error("回复出错:", error);
+      alert("回复失败");
+    } finally {
+      setIsReplying(false);
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <main className="min-h-screen bg-gray-50 p-4 md:p-12 font-sans text-gray-800">
+      <div className="max-w-2xl mx-auto space-y-8">
+        
+        <header className="text-center space-y-3">
+          <h1 className="text-3xl font-bold text-gray-900">匿名树洞</h1>
+          <p className="text-gray-500 text-sm">完全匿名，首次发言即分配专属代号</p>
+          <div className="inline-block bg-gray-100 px-4 py-2 rounded-md border border-gray-200 mt-2">
+             <p className="text-xs text-gray-500 flex items-center justify-center gap-1">
+               <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor">
+                 <path fillRule="evenodd" d="M2.166 4.999A11.954 11.954 0 0010 1.944 11.954 11.954 0 0017.834 5c.11.65.166 1.32.166 2.001 0 5.225-3.34 9.67-8 11.317C5.34 16.67 2 12.225 2 7c0-.682.057-1.35.166-2.001zm11.541 3.708a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+               </svg>
+               如高度在意隐私，建议通过代理软件（如 Tor / VPN）改变网络路由环境后再进行访问。
+             </p>
+          </div>
+        </header>
+
+        {/* 核心改动：身份识别区 (绊码输入框) */}
+        <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-100 flex items-center gap-3">
+          <label className="text-sm font-medium text-gray-700 whitespace-nowrap">身份暗号</label>
+          <input
+            type="password"
+            value={tripcode}
+            onChange={(e) => setTripcode(e.target.value)}
+            placeholder="留空则为一次性路人。输入同一暗号即可保持同一代号。"
+            className="flex-1 p-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-300 text-sm"
+          />
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        {/* 主帖输入框 */}
+        <form onSubmit={handleSubmit} className="bg-white p-4 rounded-xl shadow-sm border border-gray-100">
+          <textarea
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            placeholder="写下你想说的话..."
+            className="w-full p-3 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-300 resize-none h-32"
+            maxLength={200}
+          />
+          <div className="flex justify-between items-center mt-3">
+            <span className={`text-sm ${content.length >= 200 ? 'text-red-500 font-bold' : 'text-gray-400'}`}>
+              {content.length}/200
+            </span>
+            <button
+              type="submit"
+              disabled={isSubmitting || !content.trim()}
+              className="bg-black text-white px-6 py-2 rounded-lg font-medium hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {isSubmitting ? "发送中..." : "发送"}
+            </button>
+          </div>
+        </form>
+
+        <div className="space-y-6">
+          {posts.map((post) => (
+            <div key={post.id} className="bg-white p-5 rounded-xl shadow-sm border border-gray-100">
+              
+              <div className="flex justify-between items-center mb-3">
+                <span className="font-bold text-gray-900">
+                  匿名网友 {post.authors?.display_id}
+                </span>
+                <span className="text-xs text-gray-400">
+                  {new Date(post.created_at).toLocaleString()}
+                </span>
+              </div>
+              <p className="text-gray-700 whitespace-pre-wrap leading-relaxed mb-4">
+                {post.content}
+              </p>
+
+              {post.replies && post.replies.length > 0 && (
+                <div className="mt-4 pl-4 border-l-2 border-gray-100 space-y-3">
+                  {post.replies.map((reply) => (
+                    <div key={reply.id} className="bg-gray-50 p-3 rounded-lg text-sm">
+                      <div className="flex justify-between items-center mb-1">
+                        <span className="font-semibold text-gray-700">
+                          匿名网友 {reply.authors?.display_id}
+                        </span>
+                        <span className="text-xs text-gray-400">
+                          {new Date(reply.created_at).toLocaleString()}
+                        </span>
+                      </div>
+                      <p className="text-gray-600">{reply.content}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="mt-4 pt-3 border-t border-gray-50 flex justify-end">
+                <button 
+                  onClick={() => setActiveReplyPostId(activeReplyPostId === post.id ? null : post.id)}
+                  className="text-sm text-gray-500 hover:text-black font-medium transition-colors"
+                >
+                  {activeReplyPostId === post.id ? "取消回复" : "回复"}
+                </button>
+              </div>
+
+              {/* 回复输入框 */}
+              {activeReplyPostId === post.id && (
+                <form onSubmit={(e) => handleReplySubmit(e, post.id)} className="mt-3 flex gap-2 items-center">
+                  <input
+                    type="text"
+                    value={replyContent}
+                    onChange={(e) => setReplyContent(e.target.value)}
+                    placeholder="写下你的回复..."
+                    className="flex-1 p-2 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gray-300 text-sm"
+                    maxLength={200}
+                    autoFocus
+                  />
+                  <span className={`text-xs w-12 text-right ${replyContent.length >= 200 ? 'text-red-500 font-bold' : 'text-gray-400'}`}>
+                    {replyContent.length}/200
+                  </span>
+                  <button
+                    type="submit"
+                    disabled={isReplying || !replyContent.trim()}
+                    className="bg-gray-800 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-black disabled:opacity-50"
+                  >
+                    {isReplying ? "..." : "发送"}
+                  </button>
+                </form>
+              )}
+
+            </div>
+          ))}
+          
+          {posts.length === 0 && (
+            <div className="text-center text-gray-400 py-12">
+              还没有人留言，来做第一个发言的人吧。
+            </div>
+          )}
         </div>
-      </main>
-    </div>
+
+      </div>
+    </main>
   );
 }
