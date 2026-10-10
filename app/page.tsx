@@ -1,38 +1,32 @@
 "use client";
 
-import { useState, useEffect, FormEvent } from "react";
+import { useState, useEffect, useRef, FormEvent } from "react";
 import { supabase } from "../lib/supabase";
+import { deriveTripcodeKey } from "../lib/tripcode";
 
+// 号码 (display_id) 直接存在帖子 / 回复上；作者 token 不再通过 API 暴露
 interface Reply {
   id: string;
   content: string;
   created_at: string;
-  authors: {
-    display_id: number;
-  };
+  display_id: number;
 }
 
 interface Post {
   id: string;
   content: string;
   created_at: string;
-  authors: {
-    display_id: number;
-  };
+  display_id: number;
   replies: Reply[];
 }
 
-// 核心密码学：将用户输入的暗号 (绊码) 转化为不可逆的伪 UUID
-async function generateTripcodeUUID(secret: string) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(secret);
-  // 使用纯原生 Web Crypto API 进行 SHA-256 哈希计算
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  const hashHex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
-  
-  // 截取哈希值的前 32 位，并强行拼接成数据库认可的 UUID 标准格式 (8-4-4-4-12)
-  return `${hashHex.slice(0, 8)}-${hashHex.slice(8, 12)}-4${hashHex.slice(13, 16)}-8${hashHex.slice(17, 20)}-${hashHex.slice(20, 32)}`;
+// 数据库函数里主动抛出的提示（如“内容不能超过 200 字”）直接展示给用户，其余统一用通用提示
+function describeError(error: unknown): string {
+  const e = error as { code?: string; message?: string } | null;
+  if (e?.message && (e.code === "P0001" || e.code === "22023")) {
+    return `：${e.message}`;
+  }
+  return "，请稍后再试";
 }
 
 export default function Home() {
@@ -42,6 +36,8 @@ export default function Home() {
 
   // 绊码 (身份暗号) 状态：保存在内存中，刷新网页即刻灰飞烟灭
   const [tripcode, setTripcode] = useState("");
+  // 缓存最近一次的派生结果，连续发言时不必重复做 PBKDF2 计算
+  const derivedKeyRef = useRef<{ secret: string; key: string } | null>(null);
 
   const [activeReplyPostId, setActiveReplyPostId] = useState<string | null>(null);
   const [replyContent, setReplyContent] = useState("");
@@ -57,42 +53,33 @@ export default function Home() {
     const { data, error } = await supabase
       .from("posts")
       .select(`
-        id, content, created_at,
-        authors ( display_id ),
-        replies ( id, content, created_at, authors ( display_id ) )
+        id, content, created_at, display_id,
+        replies ( id, content, created_at, display_id )
       `)
-      .order("created_at", { ascending: false }); 
+      .order("created_at", { ascending: false });
 
     if (error) {
       console.error("获取帖子失败:", error);
     } else {
-      const formattedData = data?.map(post => ({
+      const formattedData = ((data ?? []) as unknown as Post[]).map((post) => ({
         ...post,
-        replies: post.replies.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
-      })) as any;
+        replies: [...(post.replies ?? [])].sort(
+          (a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime(),
+        ),
+      }));
       setPosts(formattedData);
     }
   }
 
-  // 获取身份凭证的核心逻辑
-  async function resolveAuthorToken() {
-    let token;
-    if (!tripcode.trim()) {
-      // 没写密码：完全流客，生成一次性随机 UUID
-      token = crypto.randomUUID();
-    } else {
-      // 写了密码：根据密码生成固定的哈希 UUID
-      token = await generateTripcodeUUID(tripcode.trim());
+  // 身份的核心逻辑：只把暗号的派生密钥交给服务端，由数据库用私密 pepper 算出真正的身份
+  // 返回 null 表示没填暗号，即一次性路人
+  async function getTripcodeKey(): Promise<string | null> {
+    const secret = tripcode.trim();
+    if (!secret) return null;
+    if (derivedKeyRef.current?.secret !== secret) {
+      derivedKeyRef.current = { secret, key: await deriveTripcodeKey(secret) };
     }
-
-    // 尝试在数据库中注册这个身份
-    const { error } = await supabase.from("authors").insert([{ token: token }]);
-    // 错误码 '23505' 是 PostgreSQL 的“主键冲突”。
-    // 这说明该绊码对应的作者以前发过言，已经被记录了。这是完全正常的，我们忽略这个错误即可。
-    if (error && error.code !== "23505") {
-      throw error;
-    }
-    return token;
+    return derivedKeyRef.current.key;
   }
 
   async function handleSubmit(e: FormEvent) {
@@ -100,14 +87,14 @@ export default function Home() {
     if (!content.trim()) return;
     setIsSubmitting(true);
     try {
-      const token = await resolveAuthorToken();
-      const { error } = await supabase.from("posts").insert([{ author_token: token, content: content }]);
+      const key = await getTripcodeKey();
+      const { error } = await supabase.rpc("create_post", { p_content: content, p_key: key });
       if (error) throw error;
       setContent("");
       fetchPosts();
     } catch (error) {
       console.error("发帖出错:", error);
-      alert("发帖失败");
+      alert(`发帖失败${describeError(error)}`);
     } finally {
       setIsSubmitting(false);
     }
@@ -118,19 +105,19 @@ export default function Home() {
     if (!replyContent.trim()) return;
     setIsReplying(true);
     try {
-      const token = await resolveAuthorToken();
-      const { error } = await supabase.from("replies").insert([{ 
-        post_id: postId,
-        author_token: token, 
-        content: replyContent 
-      }]);
+      const key = await getTripcodeKey();
+      const { error } = await supabase.rpc("create_reply", {
+        p_post_id: postId,
+        p_content: replyContent,
+        p_key: key,
+      });
       if (error) throw error;
       setReplyContent("");
       setActiveReplyPostId(null);
       fetchPosts();
     } catch (error) {
       console.error("回复出错:", error);
-      alert("回复失败");
+      alert(`回复失败${describeError(error)}`);
     } finally {
       setIsReplying(false);
     }
@@ -194,7 +181,7 @@ export default function Home() {
               
               <div className="flex justify-between items-center mb-3">
                 <span className="font-bold text-gray-900">
-                  匿名网友 {post.authors?.display_id}
+                  匿名网友 {post.display_id}
                 </span>
                 <span className="text-xs text-gray-400">
                   {new Date(post.created_at).toLocaleString()}
@@ -210,7 +197,7 @@ export default function Home() {
                     <div key={reply.id} className="bg-gray-50 p-3 rounded-lg text-sm">
                       <div className="flex justify-between items-center mb-1">
                         <span className="font-semibold text-gray-700">
-                          匿名网友 {reply.authors?.display_id}
+                          匿名网友 {reply.display_id}
                         </span>
                         <span className="text-xs text-gray-400">
                           {new Date(reply.created_at).toLocaleString()}
